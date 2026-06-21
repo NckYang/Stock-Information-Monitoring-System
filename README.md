@@ -1,4 +1,4 @@
-# 股市監測儀表板 Stock Monitoring Dashboard
+# 股市資訊監測系統 Stock Monitoring Dashboard
 
 這是一個使用 Python 與 Streamlit 製作的股市資訊監控工具。使用者可以自訂股票清單，查看當日漲跌幅、近 7 日與近 30 日報酬率、K 線圖、累積報酬走勢、新聞列表，並可設定 Discord 價格提醒。新聞情緒分析可串接 Google Gemini API，讓模型依新聞標題、摘要與內文片段判斷正向、中性或負向。
 
