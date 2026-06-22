@@ -11,7 +11,7 @@ import hashlib
 # ----------------------------
 # 基本設定與狀態初始化
 # ----------------------------
-st.set_page_config(page_title="股市監測儀表板", layout="wide")
+st.set_page_config(page_title="股市資訊監測系統", layout="wide")
 
 # 初始化 session_state 用來儲存使用者設定的警報
 if "price_alerts" not in st.session_state:
@@ -46,7 +46,7 @@ div[data-testid="stMetricLabel"] {
 </style>
 """, unsafe_allow_html=True)
 
-st.title("股市監測儀表板")
+st.title("股市資訊監測系統")
 st.caption("可自訂股票代號，查看報酬率、新聞聲量，並設定價格警報")
 
 # ----------------------------
@@ -465,7 +465,7 @@ if "news_cache_cleared_on_open" not in st.session_state:
 st.sidebar.header("監控標的設定")
 
 with st.sidebar.form("add_ticker_form", clear_on_submit=True):
-    new_ticker_input = st.text_input("新增股票代號 (多檔請用逗號分隔)")
+    new_ticker_input = st.text_input("新增股票代號，台股請加.TW (多檔請用逗號分隔)")
     submit_add = st.form_submit_button("新增至清單")
     
     if submit_add and new_ticker_input.strip():
