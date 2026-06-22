@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 import urllib.parse
 import plotly.graph_objects as go
 import os
+import hashlib
 
 # ----------------------------
 # 基本設定與狀態初始化
@@ -18,7 +19,7 @@ if "price_alerts" not in st.session_state:
 
 # 初始化 session_state 用來儲存歷史監控清單
 if "monitor_list" not in st.session_state:
-    st.session_state.monitor_list = ["2330.TW", "2454.TW", "2317.TW", "NVDA", "^TWII", "0056.TW", "00878.TW"]
+    st.session_state.monitor_list = ["2330.TW", "2454.TW", "2317.TW", "NVDA", "^TWII", "0056.TW", "00878.TW", "0050.TW"]
 
 st.markdown("""
 <style>
@@ -157,11 +158,49 @@ def get_return_stats(ticker: str, period: str):
 def get_gemini_api_key():
     key = os.getenv("GEMINI_API_KEY")
     if key:
-        return key
+        return key.strip()
     try:
-        return st.secrets.get("GEMINI_API_KEY")
+        key = st.secrets.get("GEMINI_API_KEY")
+        if key:
+            return str(key).strip()
     except Exception:
-        return None
+        pass
+    return None
+
+
+def get_gemini_model():
+    model = os.getenv("GEMINI_MODEL")
+    if model:
+        return normalize_gemini_model_name(model)
+    try:
+        model = st.secrets.get("GEMINI_MODEL")
+        if model:
+            return normalize_gemini_model_name(str(model))
+    except Exception:
+        pass
+    return "gemini-3.1-flash-lite"
+
+
+def normalize_gemini_model_name(model: str) -> str:
+    model = model.strip()
+    if model.startswith("models/"):
+        model = model.removeprefix("models/")
+    return model or "gemini-3.1-flash-lite"
+
+
+def get_gemini_model_candidates(model: str) -> list[str]:
+    candidates = [normalize_gemini_model_name(model)]
+    for fallback_model in ["gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"]:
+        if fallback_model not in candidates:
+            candidates.append(fallback_model)
+    return candidates
+
+
+def get_gemini_api_key_marker(api_key) -> str:
+    if not api_key:
+        return "missing"
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:10]
+    return f"set-{digest}"
 
 
 def fetch_news_article_text(url: str) -> str:
@@ -230,19 +269,46 @@ def extract_gemini_text(data: dict) -> str:
     return "\n".join(texts)
 
 
+def describe_gemini_empty_response(data: dict) -> str:
+    prompt_feedback = data.get("promptFeedback", {})
+    if prompt_feedback.get("blockReason"):
+        return f"promptFeedback.blockReason={prompt_feedback.get('blockReason')}"
+
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return "no candidates"
+
+    details = []
+    for candidate in candidates[:2]:
+        finish_reason = candidate.get("finishReason")
+        if finish_reason:
+            details.append(f"finishReason={finish_reason}")
+        safety = candidate.get("safetyRatings")
+        if safety:
+            blocked = [
+                item.get("category", "unknown")
+                for item in safety
+                if item.get("blocked")
+            ]
+            if blocked:
+                details.append(f"blocked={','.join(blocked)}")
+
+    return "; ".join(details) or "empty candidates text"
+
+
 def classify_news_sentiment_with_ai(
     ticker: str,
     stock_name: str,
     title: str,
     description: str,
-    article_text: str
-) -> str:
+    article_text: str,
+    model: str
+) -> tuple[str, str]:
     api_key = get_gemini_api_key()
     fallback = fallback_news_sentiment(title, description, article_text)
     if not api_key:
-        return fallback
+        return fallback, "備援：未設定 GEMINI_API_KEY"
 
-    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     prompt = f"""
 請判斷以下新聞對「{stock_name} ({ticker})」的市場情緒是 positive、neutral、negative 三者之一。
 
@@ -263,15 +329,7 @@ RSS摘要：
 {article_text[:2500]}
 """.strip()
 
-    try:
-        endpoint = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={api_key}"
-        )
-        res = requests.post(
-            endpoint,
-            headers={"Content-Type": "application/json"},
-            json={
+    payload = {
                 "contents": [
                     {
                         "role": "user",
@@ -280,27 +338,59 @@ RSS摘要：
                 ],
                 "generationConfig": {
                     "temperature": 0,
-                    "maxOutputTokens": 10,
+                    "maxOutputTokens": 80,
+                    "candidateCount": 1,
                 },
-            },
-            timeout=25,
-        )
-        res.raise_for_status()
-        label = extract_gemini_text(res.json()).strip().lower()
-        if "positive" in label:
-            return "positive"
-        if "negative" in label:
-            return "negative"
-        if "neutral" in label:
-            return "neutral"
-    except Exception:
-        return fallback
+    }
 
-    return fallback
+    errors = []
+    for candidate_model in get_gemini_model_candidates(model):
+        try:
+            endpoint = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{candidate_model}:generateContent?key={api_key}"
+            )
+            res = requests.post(
+                endpoint,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=25,
+            )
+            res.raise_for_status()
+            label = extract_gemini_text(res.json()).strip().lower()
+            if "positive" in label:
+                return "positive", f"Gemini API ({candidate_model})"
+            if "negative" in label:
+                return "negative", f"Gemini API ({candidate_model})"
+            if "neutral" in label:
+                return "neutral", f"Gemini API ({candidate_model})"
+            empty_reason = describe_gemini_empty_response(res.json())
+            return fallback, f"備援：Gemini 回覆格式無法解析 ({label[:40] or empty_reason})"
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            detail = e.response.text[:120] if e.response is not None else str(e)
+            errors.append(f"{candidate_model}: HTTP {status} {detail}")
+            if status != 404:
+                break
+        except requests.RequestException as e:
+            errors.append(f"{candidate_model}: 連線失敗 {str(e)[:120]}")
+            break
+        except Exception as e:
+            errors.append(f"{candidate_model}: {str(e)[:120]}")
+            break
+
+    return fallback, f"備援：Gemini API 全部失敗 ({' | '.join(errors)[:240]})"
 
 
 @st.cache_data(ttl=3600)
-def get_news_sentiment(ticker: str, stock_name: str):
+def get_news_sentiment(
+    ticker: str,
+    stock_name: str,
+    gemini_key_marker: str,
+    gemini_model: str
+):
+    # gemini_key_marker and gemini_model are part of Streamlit's cache key.
+    # This prevents old fallback results from being reused after changing Gemini settings.
     if ticker == "^TWII":
         search_keyword = "台股 大盤"
     else:
@@ -313,12 +403,13 @@ def get_news_sentiment(ticker: str, stock_name: str):
     try:
         res = requests.get(url, timeout=5)
         soup = BeautifulSoup(res.text, "xml")
-        items = soup.find_all("item")[:20]
+        items = soup.find_all("item")[:5]
 
         news_list = []
         pos_count = 0
         neg_count = 0
         neutral_count = 0
+        gemini_quota_exceeded = False
 
         for item in items:
             title = item.title.text
@@ -326,13 +417,20 @@ def get_news_sentiment(ticker: str, stock_name: str):
             pub_date = item.pubDate.text[:-13]
             description = item.description.text if item.description else ""
             article_text = fetch_news_article_text(link)
-            ai_label = classify_news_sentiment_with_ai(
-                ticker=ticker,
-                stock_name=stock_name,
-                title=title,
-                description=description,
-                article_text=article_text,
-            )
+            if gemini_quota_exceeded:
+                ai_label = fallback_news_sentiment(title, description, article_text)
+                sentiment_source = "備援：本輪已偵測到 Gemini 配額不足，停止繼續呼叫 API"
+            else:
+                ai_label, sentiment_source = classify_news_sentiment_with_ai(
+                    ticker=ticker,
+                    stock_name=stock_name,
+                    title=title,
+                    description=description,
+                    article_text=article_text,
+                    model=gemini_model,
+                )
+                if "HTTP 429" in sentiment_source:
+                    gemini_quota_exceeded = True
 
             if ai_label == "positive":
                 sentiment = "🟢 正向"
@@ -346,6 +444,7 @@ def get_news_sentiment(ticker: str, stock_name: str):
 
             news_list.append({
                 "情緒": sentiment,
+                "判斷來源": sentiment_source,
                 "新聞標題": title,
                 "發布時間": pub_date,
                 "連結": link
@@ -354,6 +453,11 @@ def get_news_sentiment(ticker: str, stock_name: str):
         return news_list, pos_count, neg_count, neutral_count
     except Exception:
         return None, 0, 0, 0
+
+
+if "news_cache_cleared_on_open" not in st.session_state:
+    get_news_sentiment.clear()
+    st.session_state.news_cache_cleared_on_open = True
 
 # ----------------------------
 # 側邊欄設定區 (使用者輸入與警報設定)
@@ -377,6 +481,24 @@ TICKERS = st.sidebar.multiselect(
 )
 
 st.session_state.monitor_list = TICKERS
+
+st.sidebar.markdown("---")
+st.sidebar.header("Gemini AI 狀態")
+gemini_api_key = get_gemini_api_key()
+gemini_model = get_gemini_model()
+gemini_key_marker = get_gemini_api_key_marker(gemini_api_key)
+
+if gemini_api_key:
+    st.sidebar.success("已讀取 GEMINI_API_KEY")
+else:
+    st.sidebar.warning("未讀取 GEMINI_API_KEY，新聞情緒會使用備援判斷")
+
+st.sidebar.caption(f"目前模型：{gemini_model}")
+st.sidebar.caption("若剛在終端機設定環境變數，請停止 Streamlit，並從同一個終端機重新啟動。")
+
+if st.sidebar.button("清除新聞快取", use_container_width=True):
+    st.cache_data.clear()
+    st.sidebar.success("已清除快取，請等待頁面重新整理")
 
 st.sidebar.markdown("---")
 st.sidebar.header("價格警報與通知設定")
@@ -636,7 +758,12 @@ with col_chart2:
 st.markdown("---")
 
 with st.spinner(f"正在分析 {current_stock_name} ({selected_ticker}) 的網路新聞..."):
-    news_data, pos, neg, neu = get_news_sentiment(selected_ticker, current_stock_name)
+    news_data, pos, neg, neu = get_news_sentiment(
+        selected_ticker,
+        current_stock_name,
+        gemini_key_marker,
+        gemini_model,
+    )
 
 if news_data:
     total_news = pos + neg + neu
