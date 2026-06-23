@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import urllib.parse
+import xml.etree.ElementTree as ET
 import plotly.graph_objects as go
 import os
 import hashlib
@@ -233,6 +234,11 @@ def fetch_news_article_text(url: str) -> str:
         return ""
 
 
+def clean_rss_text(text: str) -> str:
+    """Remove simple HTML markup from RSS text."""
+    return BeautifulSoup(text or "", "html.parser").get_text(" ", strip=True)
+
+
 def fallback_news_sentiment(title: str, description: str, article_text: str) -> str:
     text = f"{title} {description} {article_text}"
     positive_words = [
@@ -397,13 +403,21 @@ def get_news_sentiment(
         clean_ticker = ticker.split('.')[0]
         search_keyword = f"{clean_ticker} {stock_name}"
 
-    query = urllib.parse.quote(search_keyword)
+    query = urllib.parse.quote(f"{search_keyword} when:14d")
     url = f"https://news.google.com/rss/search?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
 
     try:
-        res = requests.get(url, timeout=5)
-        soup = BeautifulSoup(res.text, "xml")
-        items = soup.find_all("item")[:5]
+        res = requests.get(url, headers=headers, timeout=10)
+        res.raise_for_status()
+        root = ET.fromstring(res.content)
+        items = root.findall("./channel/item")[:5]
 
         news_list = []
         pos_count = 0
@@ -412,10 +426,13 @@ def get_news_sentiment(
         gemini_quota_exceeded = False
 
         for item in items:
-            title = item.title.text
-            link = item.link.text
-            pub_date = item.pubDate.text[:-13]
-            description = item.description.text if item.description else ""
+            title = item.findtext("title", default="").strip()
+            link = item.findtext("link", default="").strip()
+            pub_date = item.findtext("pubDate", default="").strip()
+            description = clean_rss_text(item.findtext("description", default=""))
+            if not title or not link:
+                continue
+
             article_text = fetch_news_article_text(link)
             if gemini_quota_exceeded:
                 ai_label = fallback_news_sentiment(title, description, article_text)
@@ -446,13 +463,22 @@ def get_news_sentiment(
                 "情緒": sentiment,
                 "判斷來源": sentiment_source,
                 "新聞標題": title,
-                "發布時間": pub_date,
+                "發布時間": pub_date[:-13] if len(pub_date) > 13 else pub_date,
                 "連結": link
             })
 
-        return news_list, pos_count, neg_count, neutral_count
-    except Exception:
-        return None, 0, 0, 0
+        if not news_list:
+            return [], 0, 0, 0, f"Google News RSS 沒有找到「{search_keyword}」的近 14 天結果。"
+        return news_list, pos_count, neg_count, neutral_count, ""
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "unknown"
+        return [], 0, 0, 0, f"Google News RSS 回傳 HTTP {status}。"
+    except requests.RequestException as e:
+        return [], 0, 0, 0, f"Google News RSS 網路請求失敗：{str(e)[:120]}"
+    except ET.ParseError as e:
+        return [], 0, 0, 0, f"Google News RSS XML 解析失敗：{str(e)[:120]}"
+    except Exception as e:
+        return [], 0, 0, 0, f"新聞處理失敗：{str(e)[:120]}"
 
 
 if "news_cache_cleared_on_open" not in st.session_state:
@@ -758,7 +784,7 @@ with col_chart2:
 st.markdown("---")
 
 with st.spinner(f"正在分析 {current_stock_name} ({selected_ticker}) 的網路新聞..."):
-    news_data, pos, neg, neu = get_news_sentiment(
+    news_data, pos, neg, neu, news_error = get_news_sentiment(
         selected_ticker,
         current_stock_name,
         gemini_key_marker,
@@ -788,4 +814,4 @@ if news_data:
         hide_index=True
     )
 else:
-    st.info("目前抓不到相關新聞，或是網路請求失敗。")
+    st.info(news_error or "目前抓不到相關新聞，或是網路請求失敗。")
